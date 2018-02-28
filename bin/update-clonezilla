@@ -1,0 +1,101 @@
+#!/usr/bin/env python
+
+# Copyright 2008-2018 Univa Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import os.path
+import sys
+
+from tortuga.cli.tortugaCli import TortugaCli
+from tortuga.exceptions.tortugaException import TortugaException
+from tortuga.kit.loader import load_kits
+from tortuga.kit.metadata import KitMetadataSchema
+from tortuga.kit.registry import get_kit_installer
+from tortuga.os_utility.osUtility import getOsObjectFactory
+
+
+class UpdateClonezillaCli(TortugaCli):
+    """
+    CLI for updating Clonezilla support files
+
+    """
+    def __init__(self):
+        super(UpdateClonezillaCli, self).__init__()
+        self.dst_dir = os.path.join(
+            getOsObjectFactory().getOsBootHostManager().getTftproot(),
+            'tortuga'
+        )
+        load_kits()
+        kit_meta = self._get_kit_metadata()
+        kit_spec = (
+            kit_meta['name'],
+            kit_meta['version'],
+            kit_meta['iteration']
+        )
+        self._kit_installer = get_kit_installer(kit_spec)()
+        self._component_installer = \
+            self._kit_installer.get_component('management')
+
+    def _get_kit_metadata(self):
+        """
+        Gets kit metadata from the KIT_METADATA_FILE, validates it, and
+        returns the result as a python dict.
+
+        :return: dict of the loaded metadata
+
+        """
+        kit_meta_fp = open('../kit.json')
+        kit_meta = json.load(kit_meta_fp)
+        errors = KitMetadataSchema().validate(kit_meta)
+        if errors:
+            raise Exception(
+                'Kit metadata validation error: {}'.format(errors))
+        return kit_meta
+
+    def runCommand(self):
+        self.parseArgs('''update-clonezilla
+
+Update Clonezilla support files (extracted from {})
+and writes support scripts to {}.'''.format('/tmp/clonezilla-live.zip',
+                                            self.dst_dir))
+
+        sys.stdout.write(
+            'Copying Clonezilla files to: {}... '.format(self.dst_dir))
+        sys.stdout.flush()
+
+        try:
+            self._component_installer.copy_clonezilla_files(self.dst_dir)
+            sys.stdout.write('done.\n')
+        except TortugaException as exc:
+            sys.stdout.write('failed.\n')
+            sys.stderr.write('Error: %s\n' % (exc))
+            sys.exit(1)
+
+        sys.stdout.write(
+            'Creating Clonezilla support files from templates... ')
+        sys.stdout.flush()
+
+        try:
+            self._component_installer.create_clonezilla_support_files(
+                self.dst_dir)
+            sys.stdout.write('done.\n')
+        except Exception as exc:
+            sys.stdout.write('failed.\n')
+            sys.stderr.write('Error: {}\n'.format(exc))
+            sys.exit(1)
+
+
+if __name__ == '__main__':
+    UpdateClonezillaCli().run()

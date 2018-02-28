@@ -1,0 +1,367 @@
+#!/usr/bin/env python
+
+# Copyright 2008-2018 Univa Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# pylint: disable=no-member
+
+import math
+import os
+import sys
+
+from tortuga.cli import tortugaCli
+from tortuga.exceptions import invalidCliRequest
+from tortuga.exceptions.softwareProfileAlreadyExists import \
+    SoftwareProfileAlreadyExists
+from tortuga.exceptions.softwareProfileNotFound import SoftwareProfileNotFound
+from tortuga.exceptions.tortugaException import TortugaException
+from tortuga.hardwareprofile import hardwareProfileFactory
+from tortuga.os_utility import tortugaSubprocess
+from tortuga.softwareprofile import softwareProfileFactory
+
+SECTOR_SIZE = 512
+SECTOR_MSK = SECTOR_SIZE - 1
+
+
+class SetupClonezilla(tortugaCli.TortugaCli):
+    def __init__(self):
+        tortugaCli.TortugaCli.__init__(self)
+
+        self._swProfileApi = softwareProfileFactory.getSoftwareProfileApi()
+        self._hwProfileApi = hardwareProfileFactory.getHardwareProfileApi()
+
+        # Add command-line option definitions
+        optionGroup = 'Clonezilla Arguments'
+        self.addOptionGroup(optionGroup, 'arguments must be specified')
+
+        self.addOptionToGroup(
+            optionGroup, '--src-software-profile',
+            dest='srcSwProfile',
+            help='Software profile to duplicate for Clonezilla')
+
+        self.addOptionToGroup(
+            optionGroup, '--software-profile', dest='swProfile',
+            help='Software profile name for Clonezilla')
+
+        self.addOptionToGroup(
+            optionGroup, '--hardware-profile', dest='hwProfile',
+            help='Hardware profile name for Clonezilla')
+
+        self.addOptionToGroup(
+            optionGroup, '--image-name', dest='imgName',
+            help='Clonezilla image name (found in /export/clonezilla)')
+
+        self.addOptionToGroup(
+            optionGroup, '--force', action='store_true', dest='force',
+            default=False,
+            help='Force re-creation of existing hardware and/or software'
+                   ' profiles')
+
+    def __copySoftwareProfile(self, srcSwProfile, dstSwProfile):
+        """
+        Wrapper around 'copy-software-profile'
+
+        Raises:
+            SoftwareProfileNotFound
+        """
+
+        try:
+            self._swProfileApi.getSoftwareProfile(dstSwProfile)
+
+            raise SoftwareProfileAlreadyExists(
+                'Software profile [%s] already exists' % (dstSwProfile))
+        except SoftwareProfileNotFound:
+            pass
+
+        print('Copying software profile [%s] to [%s]' % (
+            srcSwProfile, dstSwProfile))
+
+        cmd = ('/opt/tortuga/bin/copy-software-profile --src %s'
+               ' --dst %s' % (srcSwProfile, dstSwProfile))
+
+        tortugaSubprocess.executeCommand(cmd)
+
+    def __validateSoftwareProfile(self, swProfileName):
+        """
+        Throws:
+            SoftwareProfileNotFound
+        """
+
+        return self._swProfileApi.getSoftwareProfile(swProfileName, {
+            'partitions': True})
+
+    def __validateHardwareProfile(self, hwProfileName):
+        """
+        Throws:
+            HardwareProfileNotFound
+        """
+
+        hwProfile = self._hwProfileApi.getHardwareProfile(hwProfileName)
+
+        if hwProfile.getInstallType() != 'clonezilla':
+            print('''
+Error: Hardware profile [%s] has an incompatible install type (%s).
+
+Clonezilla hardware profiles must have an install type of 'clonezilla'
+
+Unable to proceed.
+''' % (hwProfile, hwProfile.getInstallType()))
+
+            sys.exit(1)
+
+    def __setProfileMapping(self, swProfile, hwProfileName): \
+            # pylint: disable=no-self-use
+        """
+        Wrapper around 'set-profile-mapping'.  Any error code is ignored
+        """
+
+        print('Mapping hardware and software profiles')
+
+        cmd = ('set-profile-mapping --software-profile %s'
+               ' --hardware-profile %s' % (swProfile, hwProfileName))
+
+        tortugaSubprocess.executeCommandAndIgnoreFailure(cmd)
+
+    def __getProvisioningInterfaceIp(self, hwProfileName):
+        hwProfile = self._hwProfileApi.getHardwareProfile(
+            hwProfileName, {'nics': True, 'hardwareprofilenetworks': True})
+
+        return hwProfile.getProvisioningNics()[0].getIp()
+
+    def __updatePartitionInfo(self, swProfile, clonezillaImgName): \
+            # pylint: disable=no-self-use
+        print('Creating dummy partition entry...')
+
+        imgPathName = '/export/clonezilla/%s' % (clonezillaImgName)
+
+        if not os.path.isdir(imgPathName):
+            if not os.path.exists(imgPathName):
+                raise TortugaException(
+                    'Directory [%s] does not exist' % (imgPathName))
+
+            raise TortugaException('Invalid Clonezilla image')
+
+        diskFilePath = os.path.join(imgPathName, 'disk')
+
+        entry = None
+
+        try:
+            with open(diskFilePath) as fp:
+                entry = fp.readline()
+        except IOError as e:
+            raise TortugaException(
+                'Malformed Clonezilla image. Unable to open file [%s]: %s' % (
+                    diskFilePath, e))
+
+        if not entry:
+            raise TortugaException(
+                'Malformed Clonezilla image.  File [%s] is corrupt' % (
+                    diskFilePath))
+
+        deviceName = entry.rstrip()
+
+        # vda-pt.parted
+
+        diskGeometryFile = os.path.join(
+            imgPathName, '%s-pt.parted' % (deviceName))
+
+        if not os.path.exists(diskGeometryFile):
+            raise TortugaException(
+                'Malformed Clonezilla image.  File [%s] missing!' % (
+                    diskGeometryFile))
+
+        sectors = None
+
+        with open(diskGeometryFile) as fp:
+            # Disk /dev/vda: 15625000s
+            try:
+                for line in fp.readlines():
+                    if not line.startswith('Disk '):
+                        continue
+
+                    _, value = line.rstrip().rsplit(' ', 1)
+
+                    if value[-1:] != 's':
+                        raise TortugaException(
+                            'Unable to parse sector size from file [%s]' % (
+                                diskGeometryFile))
+
+                    try:
+                        sectors = int(value[:-1])
+
+                        break
+                    except ValueError:
+                        raise TortugaException(
+                            'Unknown sector size/file format for'
+                            ' file [%s]' % (diskGeometryFile))
+            except IOError as e:
+                raise TortugaException(
+                    'Malformed Clonezilla image.  Unable to open file [%s]:'
+                    ' %s' % (diskGeometryFile, e))
+
+        if sectors is None:
+            raise TortugaException('Malformed geometry file [%s]' % (
+                diskGeometryFile))
+
+        diskSizeInBytes = SECTOR_SIZE * sectors
+
+        #diskSizeInMB = diskSizeInBytes / (1024 * 1024)
+        diskSizeInMB = diskSizeInBytes / (1000.0 * 1000.0)
+
+        #adjDiskSizeInMB = (diskSizeInMB + SECTOR_MSK) & (~SECTOR_MSK)
+        adjDiskSizeInMB = int(math.ceil(((diskSizeInBytes + SECTOR_MSK) & \
+            (~SECTOR_MSK)) / (1000.0 * 1000.0)))
+
+        print('Node image disk size: [%d MB]' % (diskSizeInMB))
+        print('Adjusted disk size: [%d MB]' % (adjDiskSizeInMB))
+
+        cmd = 'update-software-profile --name %s' % (swProfile)
+
+        # Check if we need to add the software profile
+        for p in swProfile.getPartitions():
+            if p.getName() == 'root':
+                cmd += (' --update-partition root --disk-size %d'
+                        ' --size %d' % (adjDiskSizeInMB, adjDiskSizeInMB))
+
+                break
+        else:
+            cmd += (' --add-partition root --device 1.1 --mount-point /'
+                    ' --disk-size %d --size %d --file-system ext3'
+                    ' --no-preserve --no-boot-loader') % (
+                        adjDiskSizeInMB, adjDiskSizeInMB)
+
+        tortugaSubprocess.executeCommand(cmd)
+
+    def __updateSoftwareProfile(self, swProfile):
+        imgName = self.getOptions().imgName
+        ipAddress = self.__getProvisioningInterfaceIp(
+            self.getOptions().hwProfile)
+
+        print('Updating software profile [%s]' % (swProfile))
+
+        # Adjusted the tftp command-line to exclude the "-b" (blocksize)
+        # argument since this causes issues with the Ubuntu-based
+        # Clonezilla live image
+        cmd = ('update-software-profile --name %(swProfileName)s'
+               ' --kernel vmlinuz-cz'
+               ' --initrd initrd-cz.img'
+               ' --kernel-parameters \"boot=live config noprompt'
+               ' vga=788'
+               ' fetch=tftp://%(primaryip)s/filesystem.squashfs'
+               ' installer_ip=%(primaryip)s'
+               ' --'
+               ' ocs_prerun=\\\"busybox tftp -g -r'
+               ' clonezilla_custom_ocs -l /tmp/clonezilla_custom_ocs'
+               ' %(primaryip)s\\\"'
+               ' ocs_live_run=\\\"bash /tmp/clonezilla_custom_ocs\\\"'
+               ' live-config.keyboard-layouts=NONE'
+               ' live-config.locales=en_US.UTF-8'
+               ' nolocales'
+               ' imgname=%(imgName)s\"' % (
+                   {
+                       'swProfileName': str(swProfile),
+                       'primaryip': ipAddress,
+                       'imgName': imgName
+                   })
+              )
+
+        tortugaSubprocess.executeCommand(cmd)
+
+        self.__updatePartitionInfo(swProfile, imgName)
+
+    def __validateClonezillaImageName(self, clonezillaImgName): \
+            # pylint: disable=no-self-use
+        imgPathName = '/export/clonezilla/%s' % (clonezillaImgName)
+
+        if not os.path.exists(imgPathName):
+            raise invalidCliRequest.InvalidCliRequest(
+                'Clonezilla image [%s] does not exist. Unable to proceed' % (
+                    imgPathName))
+
+    def runCommand(self):
+        self.parseArgs("""
+setup-clonezilla [options]""")
+
+        # Validate the specified clonezilla image name
+        self.__validateClonezillaImageName(self.getOptions().imgName)
+
+        if self.getOptions().swProfile is None:
+            raise invalidCliRequest.InvalidCliRequest(
+                'Missing --software-profile argument')
+
+        if self.getOptions().hwProfile is None:
+            raise invalidCliRequest.InvalidCliRequest(
+                'Missing --hardware-profile argument')
+
+        # Duplicate existing software profile if '--dst-software-profile'
+        # is specified
+        if self.getOptions().srcSwProfile is not None:
+            # Check if source software profile exists
+            self._swProfileApi.getSoftwareProfile(
+                self.getOptions().srcSwProfile)
+
+            # Check if destination software profile exists
+            bDstExists = False
+
+            swProfile = None
+
+            try:
+                swProfile = self.__validateSoftwareProfile(
+                    self.getOptions().swProfile)
+
+                bDstExists = True
+            except SoftwareProfileNotFound:
+                pass
+
+
+            if bDstExists:
+                if not self.getOptions().force:
+                    raise invalidCliRequest.InvalidCliRequest(
+                        'Software profile [%s] already exists; use --force'
+                        ' option to overwrite' % (
+                            self.getOptions().swProfile))
+
+                # Attempt to forcibly remove existing software profile;
+                # this can raise an exception if nodes are associated
+                # with this software profile.
+
+                print('Attempting to remove software profile [%s]' % (
+                    self.getOptions().swProfile))
+
+                self._swProfileApi.deleteSoftwareProfile(
+                    self.getOptions().swProfile)
+
+            self.__copySoftwareProfile(
+                self.getOptions().srcSwProfile,
+                self.getOptions().swProfile)
+
+            swProfile = self._swProfileApi.getSoftwareProfile(
+                self.getOptions().swProfile, {'partitions': True})
+        else:
+            # Specified software profile must exist to proceed
+            swProfile = self.__validateSoftwareProfile(
+                self.getOptions().swProfile)
+
+        # Ensure hardware profile exists
+        self.__validateHardwareProfile(self.getOptions().hwProfile)
+
+        print('Updating existing software profile [%s]' % (swProfile))
+
+        self.__setProfileMapping(swProfile, self.getOptions().hwProfile)
+
+        self.__updateSoftwareProfile(swProfile)
+
+
+if __name__ == '__main__':
+    SetupClonezilla().run()

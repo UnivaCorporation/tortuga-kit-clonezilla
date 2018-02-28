@@ -1,0 +1,134 @@
+#!/bin/bash
+
+# Copyright 2008-2018 Univa Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+. /usr/share/drbl/sbin/drbl-functions
+
+function get_first_hd() {
+  awk '/[hsv]d[a-z]$/ {print $4}' </proc/partitions |sort -r | tail -1
+}
+
+parse_cmdline_option hostname
+eval hostname=\\$hostname
+
+parse_cmdline_option installer_ip
+eval installer_ip=\\$installer_ip
+
+puppet_master="$puppet_master"
+
+url="https://\$installer_ip:8443/v1/nodes/\$hostname"
+
+function is_root_filesystem {
+    [[ -d \$1/etc ]] && [[ -f \$1/etc/fstab ]]
+}
+
+rootpart=
+
+mntpnt="/mnt"
+
+# Determine if an LVM volume group is present
+volgroup=\$(vgdisplay -c | cut -d: -f1 | tr -d ' ' | head -1)
+
+if [ -n "\${volgroup}" ]; then
+    for vol in \$(lvdisplay --colon | awk -F ":" '{print \$1}' | tr -d " "); do
+        blkid -p -u filesystem \$vol >/dev/null 2>&1
+        if [ \$? -ne 0 ]; then
+            continue
+        fi
+
+        mount \$vol \$mntpnt
+        if [ \$? -ne 0 ]; then
+            echo "Warning: unable to mount partition \${p}"
+
+            continue
+        fi
+
+        # Attempt to find / (root) filesystem fingerprint
+        if `is_root_filesystem \$mntpnt`; then
+            rootpart="\$vol"
+            break
+        fi
+
+        umount \$mntpnt
+    done
+else
+    firsthd="/dev/`get_first_hd`"
+
+    for p in \$(lsblk -o NAME,FSTYPE,UUID -n -l -p \$firsthd | egrep -v "(^\${firsthd} | swap |_member )" | awk '{print \$NF}')
+    do
+        mount /dev/disk/by-uuid/\$p \$mntpnt
+
+        if [ \$? -ne 0 ]; then
+            echo "Warning: unable to mount partition \${p}"
+
+            continue
+        fi
+
+        # If the partition has an 'etc' directory containing a file named
+        # 'fstab', we assume this is a root partition.
+
+        if `is_root_filesystem \$mntpnt`; then
+            rootpart=\$p
+
+            break
+        fi
+
+        umount \$mntpnt
+    done
+fi
+
+if [ -z "\$rootpart" ]; then
+    echo "FATAL ERROR: unable to determine root partition"
+    exit 1
+fi
+
+sed -i -e 's/^HOSTNAME.*/HOSTNAME=localhost.localdomain/' \$mntpnt/etc/sysconfig/network
+
+# Configure the Puppet client
+cat >\$mntpnt/etc/rc.d/rc.local <<ENDL
+#!/bin/sh
+
+touch /var/lock/subsys/local
+
+rm -f /etc/profile.nii
+
+puppet="puppet agent --logdest /tmp/puppet_bootstrap.log --onetime \
+--no-daemonize --verbose --server \$puppet_master"
+
+if [ ! -f /opt/tortuga/var/run/CONFIGURED ]; then
+    # Bootstrap Puppet
+    puppet="\\$puppet --waitforcert 120"
+fi
+
+\\$puppet
+ENDL
+
+# Unmount the guest filesystem
+umount \$mntpnt
+
+# WARNING: the following line must exist to prevent an install/reboot/install
+# loop.  This toggles the flag on the installer to allow the compute
+# node to boot from it's local disk instead of always using PXE.
+echo "Updating node status..."
+
+wget -o- --auth-no-challenge --no-check-certificate \
+    --user=cfm --password="{{ cfmpasswd }}" \
+    --method PUT \
+    --header "Content-Type: application/json" \
+    --body-data "{ \"state\": \"Provisioned\", \"bootFrom\": \"1\" }" \
+    \$url
+
+# Finally, reboot the newly deployed node
+reboot

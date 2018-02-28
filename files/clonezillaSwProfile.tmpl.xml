@@ -1,0 +1,4 @@
+<softwareprofile name="$name">
+    <description>$description</description>
+    <type>compute</type>
+</softwareprofile>
