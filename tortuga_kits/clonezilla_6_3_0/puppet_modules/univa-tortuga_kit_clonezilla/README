@@ -1,16 +1,11 @@
-tortuga_kit_clonezilla
+# Tortuga Clonezilla Kit
 
-This is the tortuga_kit_clonezilla module.
+This is the source of the Tortuga Clonezilla Kit
 
-License
--------
+## License
 
+Tortuga and its kits are licensed under the [Apache License, Version 2.0](https://github.com/UnivaCorporation/tortuga/blob/master/LICENSE)
 
-Contact
--------
+## Support
 
-
-Support
--------
-
-Please log tickets and issues at our [Projects site](http://projects.example.com)
+Please log tickets and issues [here](https://github.com/UnivaCorporation/tortuga-kit-clonezilla/issues)
